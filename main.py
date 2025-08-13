@@ -1,391 +1,255 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-import asyncio
-import httpx
-
-from telegram import Update
+from groq import Groq
+from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-load_dotenv()
+# ========== CONFIG (set di Railway sebagai Environment Variable) ==========
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")        # BotFather token
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN")            # optional
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")            # ganti OpenAI
+# ==========================================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GENIUS_API_TOKEN = os.getenv("GENIUS_API_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not TELEGRAM_BOT_TOKEN or not GENIUS_API_TOKEN or not GROQ_API_KEY:
-raise ValueError("Pastikan TELEGRAM_BOT_TOKEN, GENIUS_API_TOKEN, dan GROQ_API_KEY sudah di .env!")
-
-=== Scraper Functions with error handling and timeout ===
-
-def scrape_genius(song_title):
-try:
-headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
-search_url = "https://api.genius.com/search"
-response = requests.get(search_url, headers=headers, params={"q": song_title}, timeout=10)
-response.raise_for_status()
-hits = response.json().get("response", {}).get("hits", [])
-if not hits:
-return None
-
-song_data = hits[0]["result"]  
-    song_url = song_data["url"]  
-
-    page = requests.get(song_url, timeout=10)  
-    soup = BeautifulSoup(page.text, "html.parser")  
-
-    lyrics_divs = soup.find_all("div", {"data-lyrics-container": "true"})  
-    lyrics = "\n".join([div.get_text(separator="\n") for div in lyrics_divs]).strip()  
-
-    artist = song_data["primary_artist"]["name"]  
-    cover_image = song_data.get("song_art_image_url") or ""  
-
-    album = "-"  
-    release_date = "-"  
-    label = "-"  
-    composer = "-"  
-    arranger = "-"  
-
-    return {  
-        "source": "Genius",  
-        "song_url": song_url,  
-        "artist": artist,  
-        "song_title": song_title,  
-        "album": album,  
-        "release_date": release_date,  
-        "label": label,  
-        "composer": composer,  
-        "arranger": arranger,  
-        "cover_image": cover_image,  
-        "lyrics": lyrics,  
-    }  
-except Exception as e:  
-    print(f"Genius scraping error: {e}")  
-    return None
-
-def scrape_azlyrics(song_title):
-try:
-search_url = f"https://search.azlyrics.com/search.php?q={song_title.replace(' ', '+')}"
-res = requests.get(search_url, timeout=10)
-res.raise_for_status()
-soup = BeautifulSoup(res.text, "html.parser")
-table = soup.find("td", class_="text-left visitedlyr")
-if not table:
-return None
-
-first_link = table.find("a")  
-    if not first_link:  
-        return None  
-
-    song_url = first_link["href"]  
-    song_page = requests.get(song_url, timeout=10)  
-    song_page.raise_for_status()  
-    song_soup = BeautifulSoup(song_page.text, "html.parser")  
-
-    divs = song_soup.find_all("div", attrs={"class": None, "id": None})  
-    lyrics = divs[0].get_text("\n").strip() if divs else None  
-
-    return {  
-        "source": "AZLyrics",  
-        "song_url": song_url,  
-        "artist": "-",  
-        "song_title": song_title,  
-        "album": "-",  
-        "release_date": "-",  
-        "label": "-",  
-        "composer": "-",  
-        "arranger": "-",  
-        "cover_image": "https://via.placeholder.com/320",  
-        "lyrics": lyrics,  
-    }  
-except Exception as e:  
-    print(f"AZLyrics scraping error: {e}")  
-    return None
-
-def scrape_lyricsfreak(song_title):
-try:
-search_url = f"https://www.lyricsfreak.com/search.php?a=search&type=song&q={song_title.replace(' ', '+')}"
-res = requests.get(search_url, timeout=10)
-res.raise_for_status()
-soup = BeautifulSoup(res.text, "html.parser")
-results = soup.select("div.song > a")
-if not results:
-return None
-
-first_link = results[0]["href"]  
-    if not first_link.startswith("http"):  
-        first_link = "https://www.lyricsfreak.com" + first_link  
-
-    song_page = requests.get(first_link, timeout=10)  
-    song_page.raise_for_status()  
-    song_soup = BeautifulSoup(song_page.text, "html.parser")  
-
-    lyrics_div = song_soup.find("div", class_="lyrics")  
-    lyrics = lyrics_div.get_text("\n").strip() if lyrics_div else None  
-
-    artist_tag = song_soup.find("a", class_="artist")  
-    artist = artist_tag.text.strip() if artist_tag else "-"  
-
-    return {  
-        "source": "LyricsFreak",  
-        "song_url": first_link,  
-        "artist": artist,  
-        "song_title": song_title,  
-        "album": "-",  
-        "release_date": "-",  
-        "label": "-",  
-        "composer": "-",  
-        "arranger": "-",  
-        "cover_image": "https://via.placeholder.com/320",  
-        "lyrics": lyrics,  
-    }  
-except Exception as e:  
-    print(f"LyricsFreak scraping error: {e}")  
-    return None
-
-def scrape_lyricscom(song_title):
-try:
-search_url = f"https://www.lyrics.com/serp.php?st={song_title.replace(' ', '+')}&qtype=2"
-res = requests.get(search_url, timeout=10)
-res.raise_for_status()
-soup = BeautifulSoup(res.text, "html.parser")
-first_link_tag = soup.select_one("td.tal.qx > a")
-if not first_link_tag:
-return None
-
-song_url = "https://www.lyrics.com" + first_link_tag.get("href", "")  
-    song_page = requests.get(song_url, timeout=10)  
-    song_page.raise_for_status()  
-    song_soup = BeautifulSoup(song_page.text, "html.parser")  
-
-    lyrics_div = song_soup.find("pre", id="lyric-body-text")  
-    lyrics = lyrics_div.get_text("\n").strip() if lyrics_div else None  
-
-    artist_tag = song_soup.find("h3", class_="lyric-artist")  
-    artist = artist_tag.text.strip() if artist_tag else "-"  
-
-    cover_image_tag = song_soup.select_one("div.lyric-meta > img")  
-    cover_image = cover_image_tag["src"] if cover_image_tag else "https://via.placeholder.com/320"  
-
-    return {  
-        "source": "Lyrics.com",  
-        "song_url": song_url,  
-        "artist": artist,  
-        "song_title": song_title,  
-        "album": "-",  
-        "release_date": "-",  
-        "label": "-",  
-        "composer": "-",  
-        "arranger": "-",  
-        "cover_image": cover_image,  
-        "lyrics": lyrics,  
-    }  
-except Exception as e:  
-    print(f"Lyrics.com scraping error: {e}")  
-    return None
-
-=== Groq Integration ===
-
-async def merge_and_clean_with_groq(data_list):
-prompt = f"""
-Berikut ini adalah beberapa data lirik dan metadata lagu dari berbagai sumber berbeda:
-
-{data_list}
-
-Tolong gabungkan dan rapikan menjadi satu data lengkap dengan format ini:
-
-Artist: ...
-Song: ...
-Label: ...
-Release Date: ...
-Album/Single: ...
-Arranger: ...
-Composer: ...
-Cover Image URL: ...
-Lyrics: ...
-
-Buat hasil yang paling lengkap dan rapi berdasarkan data di atas.
+# HTML template (tetap sama seperti sebelumnya)
+HTML_TEMPLATE = """<!-- Judul Post -->
+<h2 style="text-align: center; font-size: 28px; margin-bottom: 15px;">
+  {post_title}
+</h2>
+<!-- Gambar Utama -->
+<div style="text-align: center; margin-bottom: 20px;">
+  <img src="{image_url}" alt="Deskripsi Gambar" title="{post_title}" style="max-width: 100%; border-radius: 12px;">
+</div>
+<!-- Informasi Detail -->
+<details class="spoiler" open="">
+  <summary><h4 style="text-align: left;">📌 Informasi Lengkap</h4></summary>
+  <div class="table" style="overflow-x:auto;">
+    <table style="width: 100%; border-collapse: collapse; font-size: 15px;">
+      <tbody>
+        <tr><td>Kategori</td><td>{category}</td></tr>
+        <tr><td>Judul</td><td>{title}</td></tr>
+        <tr><td>Pencipta / Artist</td><td>{artist}</td></tr>
+        <tr><td>Tanggal Rilis</td><td>{release_date}</td></tr>
+        <tr><td>Durasi / Panjang</td><td>{duration}</td></tr>
+        <tr><td>Bahasa</td><td>{language}</td></tr>
+        <tr><td>Link Resmi</td>
+          <td><a href="{source_url}" target="_blank" rel="noopener noreferrer">Klik di sini</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</details>
+<hr style="margin: 20px 0;">
+<!-- Deskripsi Singkat -->
+<h3>📖 Deskripsi</h3>
+<p style="text-align: justify;">{description}</p>
+<!-- Lirik / Konten Utama -->
+<h3>🎵 Lirik / Konten Utama</h3>
+<pre style="background: #f4f4f4; padding: 15px; border-radius: 8px; font-size: 14px; white-space: pre-wrap; word-wrap: break-word;">
+{content_main}
+</pre>
+<!-- Fakta Menarik -->
+<h3>💡 Fakta Menarik</h3>
+<ul>{facts}</ul>
+<!-- Embed Video / Audio -->
+<h3>▶ Video / Audio</h3>
+<div style="text-align: center; margin-top: 15px;">
+  <iframe width="100%" height="315" src="https://www.youtube.com/embed/{youtube_id}" 
+    title="YouTube video player" frameborder="0" allowfullscreen></iframe>
+</div>
+<!-- Sumber Referensi -->
+<h3>🔗 Sumber</h3>
+<ol>{sources}</ol>
+<!-- Tag SEO -->
+<div style="display:none;">Tag SEO: {tags}</div>
 """
 
-headers = {  
-    "Authorization": f"Bearer {GROQ_API_KEY}",  
-    "Content-Type": "application/json",  
-}  
-payload = {  
-    "prompt": prompt,  
-    "max_tokens": 800,  
-    "temperature": 0.2,  
-}  
+# ----------------- Helper functions -----------------
 
-async with httpx.AsyncClient() as client:  
-    resp = await client.post("https://api.groq.ai/v1/generate", headers=headers, json=payload)  
-    if resp.status_code == 200:  
-        result = resp.json()  
-        return result.get("choices", [{}])[0].get("text", "").strip()  
-    else:  
-        print(f"Groq API error: {resp.status_code} - {resp.text}")  
+def split_artist_title(text: str):
+    if " - " in text:
+        left, right = text.split(" - ", 1)
+        return left.strip(), right.strip()
+    return None, text.strip()
+
+def genius_search(query: str):
+    if not GENIUS_TOKEN:
+        return None
+    url = "https://api.genius.com/search"
+    headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers, params={"q": query}, timeout=8)
+        if r.status_code != 200:
+            return None
+        hits = r.json().get("response", {}).get("hits", [])
+        if not hits:
+            return None
+        top = hits[0]["result"]
+        return {
+            "title": top.get("title"),
+            "artist": top.get("primary_artist", {}).get("name"),
+            "url": top.get("url"),
+            "image": top.get("header_image_thumbnail_url") or "",
+        }
+    except Exception:
         return None
 
-=== Helper buat parse hasil Groq jadi dict sederhana ===
+def scrape_page(url: str):
+    try:
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return {}
+        s = BeautifulSoup(r.text, "html.parser")
+        meta = {}
+        og_title = s.find("meta", property="og:title")
+        og_desc = s.find("meta", property="og:description")
+        og_image = s.find("meta", property="og:image")
+        meta["title"] = og_title["content"] if og_title and og_title.get("content") else ""
+        meta["description_meta"] = og_desc["content"] if og_desc and og_desc.get("content") else ""
+        meta["image"] = og_image["content"] if og_image and og_image.get("content") else ""
+        possible = s.find_all(["p","div","span"], limit=40)
+        excerpt = ""
+        for el in possible:
+            txt = el.get_text(" ", strip=True)
+            if 40 <= len(txt) <= 300 and "copyright" not in txt.lower():
+                excerpt = txt[:90]
+                break
+        meta["excerpt"] = excerpt
+        date_meta = s.find("meta", property="music:release_date") or s.find("meta", attrs={"name":"release_date"})
+        meta["release_date"] = date_meta["content"] if date_meta and date_meta.get("content") else ""
+        return meta
+    except Exception:
+        return {}
 
-def parse_groq_output(text):
-data = {}
-for line in text.splitlines():
-if ':' in line:
-k, v = line.split(':', 1)
-data[k.strip().lower().replace(' ', '_')] = v.strip()
-return data
+# 🔹 Fungsi AI Description (pakai Groq)
+def ai_generate_description(query: str, source: str = None):
+    if not GROQ_API_KEY:
+        return "Deskripsi otomatis tidak tersedia (Groq API key belum diset)."
+    
+    client = Groq(api_key=GROQ_API_KEY)
+    prompt = (
+        f"Buat deskripsi ringkas (2-3 kalimat) tentang lagu atau konten berikut: '{query}'. "
+        "Jangan tulis lirik lengkap. Sebutkan tema/nuansa lagu jika memungkinkan. Sertakan sumber jika ada."
+    )
+    if source:
+        prompt += f" Sumber: {source}"
+    try:
+        res = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=130,
+            temperature=0.6
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(AI gagal: {e})"
 
-=== Generate HTML sesuai format yang kamu mau ===
+def build_html(data: dict):
+    facts_html = "".join(f"  <li>{f}</li>\n" for f in data.get("facts", []))
+    sources_html = "".join(f"  <li><a href=\"{s}\">{s}</a></li>\n" for s in data.get("sources", []))
+    youtube_id = ""
+    if data.get("youtube"):
+        m = re.search(r"(?:v=|embed/|youtu\.be/)([A-Za-z0-9_-]{6,})", data["youtube"])
+        if m:
+            youtube_id = m.group(1)
+    return HTML_TEMPLATE.format(
+        post_title = data.get("post_title", data.get("title","Untitled")),
+        image_url = data.get("image_url","URL_GAMBAR.jpg"),
+        category = data.get("category","Musik"),
+        title = data.get("title","Unknown"),
+        artist = data.get("artist","Unknown"),
+        release_date = data.get("release_date","DD/MM/YYYY"),
+        duration = data.get("duration","00:00"),
+        language = data.get("language","Unknown"),
+        source_url = data.get("source",""),
+        description = data.get("description",""),
+        content_main = data.get("content_main","[Konten utama tidak disertakan karena hak cipta]"),
+        facts = facts_html,
+        youtube_id = youtube_id,
+        sources = sources_html,
+        tags = ", ".join(data.get("tags", []))
+    )
 
-def generate_html(data):
-artist = data.get("artist", "-")
-song = data.get("song", "-")
-label = data.get("label", "-")
-release_date = data.get("release_date", "-")
-album_single = data.get("album/single", data.get("album_single", "-"))
-arranger = data.get("arranger", "-")
-composer = data.get("composer", "-")
-cover_image = data.get("cover_image_url", data.get("cover_image", "https://via.placeholder.com/320"))
-lyrics = data.get("lyrics", "-")
+# -------------- Telegram handler -----------------
+async def lirik_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Kirim: /lirik <artist> <judul> — contoh: /lirik Isyana Sarasvati My Mystery")
+        return
+    query = " ".join(args)
+    await update.message.reply_text(f"🔎 Mencari: {query}\n(Ini akan menampilkan sumber, potongan singkat, dan deskripsi — bukan lirik penuh)")
 
-html = f"""
+    maybe_artist, maybe_title = split_artist_title(query)
+    search_q = f"{maybe_artist} {maybe_title}" if maybe_title and maybe_artist else query
 
-<details class="spoiler" open="">  
-  <summary><h4 style="text-align: left;">Informasi</h4></summary>  
-  <div class="table">  
-    <table style="text-align: left;">  
-      <tbody>  
-        <tr>  
-          <td>Artist</td>  
-          <td>{artist}</td>  
-        </tr>  
-        <tr>  
-          <td>Song</td>  
-          <td>{song}</td>  
-        </tr>  
-        <tr>  
-          <td>Label</td>  
-          <td>{label}</td>  
-        </tr>  
-        <tr>  
-          <td>Release Date</td>  
-          <td>{release_date}</td>  
-        </tr>  
-        <tr>  
-          <td>Album/Single</td>  
-          <td>{album_single}</td>  
-        </tr>  
-        <tr>  
-          <td>Arranger:</td>  
-          <td>{arranger}</td>  
-        </tr>  
-        <tr>  
-          <td>Composer</td>  
-          <td>{composer}</td>  
-        </tr>  
-      </tbody>  
-    </table>  
-  </div>  
-</details>  <table align="center" cellpadding="0" cellspacing="0" class="tr-caption-container" style="margin-left: auto; margin-right: auto;">  
-  <tbody>  
-    <tr>  
-      <td style="text-align: center;">  
-        <a href="{cover_image}" style="margin-left: auto; margin-right: auto;">  
-          <img border="0" height="320" src="{cover_image}" width="320" />  
-        </a>  
-      </td>  
-    </tr>  
-    <tr>  
-      <td class="tr-caption" style="text-align: center;">  
-        Cover Image  
-      </td>  
-    </tr>  
-  </tbody>  
-</table>  
-<br />  <details class="spoiler" open="">  
-  <summary><h4 style="text-align: left;">Lirik</h4></summary>  
-  <div style="background: #fff; padding: 15px; border-radius: 8px;">  
-    <pre style="white-space: pre-wrap; font-family: Arial, sans-serif;">{lyrics}</pre>  
-  </div>  
-</details>  
-"""  
-    return html  === Helper async functions for Telegram command ===
+    genius = genius_search(search_q)
+    source = ""
+    image = ""
+    scraped = {}
+    if genius:
+        source = genius.get("url","")
+        image = genius.get("image","")
+        title = genius.get("title") or maybe_title or query
+        artist = genius.get("artist") or maybe_artist or ""
+    else:
+        title = maybe_title or query
+        artist = maybe_artist or ""
 
-async def fetch_lyrics_from_sources(song_title):
-loop = asyncio.get_event_loop()
-raw_data = await loop.run_in_executor(None, lambda: [
-f for f in [
-scrape_genius(song_title),
-scrape_azlyrics(song_title),
-scrape_lyricsfreak(song_title),
-scrape_lyricscom(song_title)
-] if f
-])
-return raw_data
+    if source:
+        scraped = scrape_page(source)
+    else:
+        try:
+            ddg = requests.get("https://html.duckduckgo.com/html/", params={"q": search_q + " lyrics"}, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+            s = BeautifulSoup(ddg.text, "html.parser")
+            a = s.find("a", {"class":"result__a"})
+            if a and a.get("href"):
+                source = a.get("href")
+                scraped = scrape_page(source)
+        except Exception:
+            scraped = {}
 
-async def process_with_groq(raw_data):
-merged_text = await merge_and_clean_with_groq(raw_data)
-return merged_text
+    excerpt = scraped.get("excerpt","")
+    if excerpt and len(excerpt) > 90:
+        excerpt = excerpt[:90]
 
-async def send_raw_lyrics(update, raw_data):
-combined_lyrics = "\n\n---\n\n".join(d.get("lyrics", "") for d in raw_data if d.get("lyrics"))
-combined_lyrics = combined_lyrics[:4000] + ("...\n[Lirik terpotong]" if len(combined_lyrics) > 4000 else "")
-await update.message.reply_text(combined_lyrics)
+    ai_desc = ai_generate_description(search_q, source)
 
-async def send_html_file(update, parsed_data, song_title):
-html_content = generate_html(parsed_data)
-file_name = f"{song_title}.html"
-with open(file_name, "w", encoding="utf-8") as f:
-f.write(html_content)
-await update.message.reply_text("Berhasil mendapatkan data. Mengirim file HTML...")
-await update.message.reply_document(document=open(file_name, "rb"), filename=file_name)
+    data = {
+        "post_title": f"{title} — {artist}" if artist else title,
+        "image_url": image or "URL_GAMBAR.jpg",
+        "category": "Musik",
+        "title": title,
+        "artist": artist,
+        "release_date": scraped.get("release_date","DD/MM/YYYY"),
+        "duration": scraped.get("duration","00:00"),
+        "language": "Indonesia/English",
+        "source": source or "",
+        "description": ai_desc or scraped.get("description_meta","Deskripsi singkat tidak tersedia."),
+        "content_main": excerpt or "[Tidak menyertakan lirik lengkap. Hanya potongan singkat atau ringkasan.]",
+        "facts": [f"Penelusuran untuk: {search_q}", f"Sumber utama: {source or 'Tidak ditemukan'}"],
+        "sources": [source] if source else [],
+        "youtube": "",
+        "tags": [artist, title]
+    }
 
-=== Telegram Command Handler ===
+    summary_txt = f"Judul: {data['title']}\nPenyanyi: {data['artist']}\nSumber: {data['source'] or '[Tidak ditemukan]'}\n\nPotongan singkat (≤90 chars):\n{data['content_main']}\n\nDeskripsi singkat:\n{data['description'][:400]}"
+    await update.message.reply_text(summary_txt)
 
-async def lirik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-try:
-if not context.args:
-await update.message.reply_text("Gunakan format: /lirik <judul lagu>")
-return
+    html = build_html(data)
+    fname = re.sub(r"[^\w\-_. ]", "_", f"{data['post_title']}.html")[:120]
+    with open("result.html","w",encoding="utf-8") as fh:
+        fh.write(html)
 
-song_title = " ".join(context.args)  
-    await update.message.reply_text(f"Mencari lirik dan info lagu: {song_title} ...")  
+    await update.message.reply_document(document=InputFile("result.html"), filename=fname)
+    await update.message.reply_text("✅ HTML hasil telah dikirim. Jika perlu, kamu bisa paste ke Blogger (ingat aturan hak cipta).")
 
-    raw_data = await fetch_lyrics_from_sources(song_title)  
-    if not raw_data:  
-        await update.message.reply_text("Lirik tidak ditemukan dari semua sumber.")  
-        return  
-
-    await update.message.reply_text("Menggabungkan dan merapikan data dengan AI...")  
-
-    merged_text = await process_with_groq(raw_data)  
-    if not merged_text:  
-        await update.message.reply_text("Gagal memproses data dengan AI, mengirim data mentah...")  
-        await send_raw_lyrics(update, raw_data)  
-        return  
-
-    parsed_data = parse_groq_output(merged_text)  
-    if not parsed_data.get("lyrics"):  
-        await update.message.reply_text("Lirik tidak ditemukan setelah pemrosesan AI.")  
-        return  
-
-    await send_html_file(update, parsed_data, song_title)  
-
-except Exception as e:  
-    error_msg = f"Terjadi kesalahan: {e}"  
-    print(error_msg)  
-    await update.message.reply_text(error_msg)
-
-=== Main Telegram Bot Setup ===
-
+# --------------- main ---------------
 def main():
-app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-app.add_handler(CommandHandler("lirik", lirik_command))
-print("Bot berjalan...")
-app.run_polling()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("lirik", lirik_handler))
+    print("Bot started")
+    app.run_polling()
 
-if name == "main":
-main()
-
+if __name__ == "__main__":
+    main()
